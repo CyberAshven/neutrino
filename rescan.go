@@ -73,6 +73,10 @@ type ChainSource interface {
 	// TODO(wilmer): extend with best hash as well.
 	Subscribe(bestHeight uint32) (*blockntfns.Subscription, error)
 
+	// FilterType returns the type of the filters the chain source syncs,
+	// which are the ones a rescan matches.
+	FilterType() wire.FilterType
+
 	// SubscribeFilterHeaderRollbacks returns a channel that receives the
 	// height the filter headers were rolled back to each time a repair
 	// finds that they were wrong above it, along with a function that
@@ -82,6 +86,10 @@ type ChainSource interface {
 	// may have been scanned with the wrong filters before the subscription.
 	SubscribeFilterHeaderRollbacks() (<-chan uint32, func())
 }
+
+// errRescanFilterType is returned by a rescan on a chain source that syncs
+// filters other than the regular ones, which it can't match.
+var errRescanFilterType = errors.New("rescans match regular filters only")
 
 // rescanOptions holds the set of functional parameters for Rescan.
 type rescanOptions struct {
@@ -336,6 +344,13 @@ func rescan(chain ChainSource, options ...RescanOption) error {
 	}
 	for _, option := range options {
 		option(ro)
+	}
+
+	// A rescan matches regular filters, and the chain source has no other
+	// type to give.
+	if fType := chain.FilterType(); fType != wire.GCSFilterRegular {
+		return fmt.Errorf("%w: the chain source syncs filter type %v",
+			errRescanFilterType, fType)
 	}
 
 	// If we have something to watch, create a watch list. The watch list

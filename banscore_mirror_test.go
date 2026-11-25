@@ -93,3 +93,35 @@ func TestBanScoreMirrorTryTake(t *testing.T) {
 		t.Fatalf("score %d is over 90", got)
 	}
 }
+
+// TestBanScoreMirrorReserve checks that room held for a later request can't
+// be taken by other requests, and is counted when claimed and free again when
+// released.
+func TestBanScoreMirrorReserve(t *testing.T) {
+	var m banScoreMirror
+	m.score.Increase(80, 0)
+	if !m.tryReserve(2, 5, 90) {
+		t.Fatal("a reservation that fits was refused")
+	}
+	taken := 0
+	for m.tryTake(1, 1, 90) {
+		taken++
+	}
+	if taken != 3 {
+		t.Fatalf("%d takes fit beside the room held, want 3", taken)
+	}
+	m.claim(5)
+	if got := m.Int(); got < 89 || got > 90 {
+		t.Fatalf("score %d after the room held is claimed, want 90", got)
+	}
+
+	var r banScoreMirror
+	r.score.Increase(80, 0)
+	if !r.tryReserve(0, 10, 90) || r.tryTake(1, 1, 90) {
+		t.Fatal("a take used room held")
+	}
+	r.release(10)
+	if !r.tryTake(1, 1, 90) {
+		t.Fatal("room released was not free")
+	}
+}

@@ -37,6 +37,9 @@ type mockChainSource struct {
 	// the rescan.
 	filterHeaderRollbacks chan uint32
 
+	// filterType is the type of the filters the mock serves.
+	filterType wire.FilterType
+
 	mu                    sync.Mutex // all fields below are protected
 	bestBlock             waddrmgr.BlockStamp
 	blockHeightIndex      map[chainhash.Hash]uint32
@@ -245,6 +248,12 @@ func (c *mockChainSource) rollbackToHeight(height int32,
 }
 
 // ChainParams returns the parameters of the current chain.
+// FilterType returns the type of the filters the mock serves, the regular
+// ones, unless filterType is set.
+func (c *mockChainSource) FilterType() wire.FilterType {
+	return c.filterType
+}
+
 func (c *mockChainSource) ChainParams() chaincfg.Params {
 	return chaincfg.MainNetParams
 }
@@ -1820,5 +1829,16 @@ func TestRescanConnectedBlockFilterEnds(t *testing.T) {
 	qo.applyQueryOptions(options...)
 	if qo.quit == nil || qo.numRetries != 0 {
 		t.Fatalf("quit %v, retries %d", qo.quit, qo.numRetries)
+	}
+}
+
+// TestRescanRefusesScriptFilters checks that a rescan on a chain source that
+// syncs script filters ends at once with an error, rather than asking for
+// regular filters the source doesn't have, again and again.
+func TestRescanRefusesScriptFilters(t *testing.T) {
+	chain := newMockChainSource(1)
+	chain.filterType = wire.GCSFilterScripts
+	if err := rescan(chain); !errors.Is(err, errRescanFilterType) {
+		t.Fatalf("rescan on script filters: %v", err)
 	}
 }

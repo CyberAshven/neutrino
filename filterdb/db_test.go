@@ -1,6 +1,7 @@
 package filterdb
 
 import (
+	"errors"
 	"math/rand"
 	"os"
 	"reflect"
@@ -187,6 +188,15 @@ func TestScriptFilterStorage(t *testing.T) {
 	}
 	if err := database.DeleteFilters([]*chainhash.Hash{&hash}, ScriptFilter); err != nil {
 		t.Fatalf("deleting from an empty database: %v", err)
+	}
+	err = walletdb.View(database.(*FilterStore).db, func(tx walletdb.ReadTx) error {
+		if tx.ReadBucket(filterBucket).NestedReadBucket(scriptBucket) != nil {
+			return errors.New("deleting made the bucket of script filters")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	regFilter, err := genRandFilter(50)
