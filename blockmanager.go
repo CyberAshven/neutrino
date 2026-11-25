@@ -238,6 +238,10 @@ type blockManager struct {
 	// queries is an interface allowing querying peers.
 	queries QueryAccess
 
+	// scriptTrees fetches the proofs and leaves of script filter entry
+	// trees from peers.
+	scriptTrees scriptTreeSource
+
 	// peerChan is a channel for messages that come from peers
 	peerChan chan interface{}
 
@@ -295,6 +299,7 @@ func newBlockManager(s *ChainService,
 	bm := blockManager{
 		server:        s,
 		queries:       s,
+		scriptTrees:   s,
 		peerChan:      make(chan interface{}, MaxPeers*3),
 		blockNtfnChan: make(chan blockntfns.BlockNtfn),
 		blkHeaderProgressLogger: newBlockProgressLogger(
@@ -2129,6 +2134,10 @@ func (b *blockManager) fetchFilterFromAllPeers(
 	served := b.fetchServedFilters(height, blockHash, filterType)
 	filters := make(map[string]*gcs.Filter, len(served))
 	for peer, f := range served {
+		// Malformed filter data. We can ignore this message.
+		if f.filter == nil {
+			continue
+		}
 		filters[peer] = f.filter
 	}
 	return filters
@@ -2170,8 +2179,9 @@ func (b *blockManager) fetchServedFilters(
 					filterType, response.Data,
 				)
 				if err != nil {
-					// Malformed filter data. We can ignore
-					// this message.
+					// Malformed filter data, which no honest
+					// peer sends: kept without a filter.
+					filterResponses[sp.Addr()] = servedFilter{}
 					return
 				}
 
