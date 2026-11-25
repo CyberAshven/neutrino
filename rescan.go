@@ -74,6 +74,10 @@ type ChainSource interface {
 	// TODO(wilmer): extend with best hash as well.
 	Subscribe(bestHeight uint32) (*blockntfns.Subscription, error)
 
+	// FilterType returns the type of the filters the chain source syncs,
+	// which are the ones a rescan matches.
+	FilterType() wire.FilterType
+
 	// SubscribeFilterHeaderRollbacks returns a channel that receives the
 	// height the filter headers were rolled back to each time a repair
 	// finds that they were wrong above it, along with a function that

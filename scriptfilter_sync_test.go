@@ -249,8 +249,8 @@ func TestScriptFilterSync(t *testing.T) {
 }
 
 // TestScriptFilterPeerProbe checks that a ChainService set to sync script
-// filters disconnects a node that doesn't serve them, which can't be told
-// from its services, and syncs no filter header from it.
+// filters disconnects a current node that doesn't serve them, which can't be
+// told from its services, and syncs no filter header from it.
 func TestScriptFilterPeerProbe(t *testing.T) {
 	node, err := rpctest.New(
 		&chaincfg.SimNetParams, nil, []string{"--noscriptfilters"},
@@ -275,9 +275,10 @@ func TestScriptFilterPeerProbe(t *testing.T) {
 	defer func() { _ = svc.Stop() }()
 
 	// It connects, as the node serves filters by its services, and then
-	// drops the node once the node hasn't answered for script filters.
+	// drops the node once the node, which is current, hasn't answered two
+	// probes for script filters in a row.
 	connected, dropped := false, false
-	deadline := time.Now().Add(time.Minute)
+	deadline := time.Now().Add(3 * time.Minute)
 	for time.Now().Before(deadline) && !dropped {
 		if svc.ConnectedCount() > 0 {
 			connected = true
