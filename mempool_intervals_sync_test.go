@@ -197,7 +197,8 @@ func TestMempoolIntervalFilters(t *testing.T) {
 }
 
 // TestMempoolFetchFloorRequiresMatch checks that a floor of one downloads an
-// interval only when its filter matches. The payment to the watched address
+// interval only when its filter matches, once the feed has sent a filter and
+// peers no longer announce transactions. The payment to the watched address
 // is reported. The unrelated transaction was admitted in an earlier interval:
 // a second service, on the default floor, has it in its mempool only once
 // that interval has closed and been downloaded, and the payment is sent
@@ -224,6 +225,20 @@ func TestMempoolFetchFloorRequiresMatch(t *testing.T) {
 	})
 	floor.NotifyMempoolReceived([]bchutil.Address{addr})
 	floor.RequestMempoolFilter([]bchutil.Address{addr}, nil)
+
+	// Until the feed has sent a filter, transactions are announced and
+	// downloaded as on regular filters.  A first transaction has the feed
+	// send one, which turns announcements off.
+	sendToNode(t, node, otherScript, 40000000)
+	deadline := time.Now().Add(time.Minute)
+	for !floor.txRelayOff.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("the feed sent no filter within a minute")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// The node reads the fee filter before the next transaction.
+	time.Sleep(time.Second)
 
 	unrelated := sendToNode(t, node, otherScript, 50000000)
 	waitForMempoolTx(t, companion, unrelated.TxHash(),
