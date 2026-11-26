@@ -90,7 +90,7 @@ func TestSearchRPAPrefixesNode(t *testing.T) {
 			func(m neutrino.RPAMatch) bool {
 				found = append(found, m)
 				return true
-			})
+			}, nil, nil, neutrino.RPAMinPeers(1))
 		if err != nil || reached != tip {
 			t.Fatalf("search for %x/%d: reached %d of %d, %v", prefix.Value, prefix.Bits, reached, tip, err)
 		}
