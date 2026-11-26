@@ -1,6 +1,7 @@
 package neutrino
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -32,7 +33,7 @@ func TestTakeBanScore(t *testing.T) {
 	// counted decays, a little within a second, so one may be gone again.
 	var fresh banScoreMirror
 	for i := 0; i < 5; i++ {
-		if !takeBanScore(&fresh, 1, tick, here, never) {
+		if takeBanScore(&fresh, 1, tick, here, never) != nil {
 			t.Fatalf("a fresh score did not take request %d", i+1)
 		}
 	}
@@ -44,7 +45,7 @@ func TestTakeBanScore(t *testing.T) {
 	// part of a score doesn't decay, so the scores below stay as they are.
 	var last banScoreMirror
 	setMirrorScore(&last, maxMempoolBanScore-1, 0)
-	if !takeBanScore(&last, 1, tick, here, never) {
+	if takeBanScore(&last, 1, tick, here, never) != nil {
 		t.Fatal("the last request the score has room for was not taken")
 	}
 
@@ -53,7 +54,7 @@ func TestTakeBanScore(t *testing.T) {
 	var full banScoreMirror
 	setMirrorScore(&full, maxMempoolBanScore, 0)
 	quit := make(chan struct{})
-	result := make(chan bool, 1)
+	result := make(chan error, 1)
 	go func() { result <- takeBanScore(&full, 1, tick, here, quit) }()
 	select {
 	case <-result:
@@ -62,9 +63,9 @@ func TestTakeBanScore(t *testing.T) {
 	}
 	close(quit)
 	select {
-	case took := <-result:
-		if took {
-			t.Fatal("a request was taken as we shut down")
+	case err := <-result:
+		if !errors.Is(err, ErrShuttingDown) {
+			t.Fatalf("a request ended with %v as we shut down", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("a waiting request did not end when we shut down")
@@ -77,8 +78,8 @@ func TestTakeBanScore(t *testing.T) {
 	// It gives up when the peer has left, even with room in the score.
 	var left banScoreMirror
 	gone := func() bool { return true }
-	if takeBanScore(&left, 1, tick, gone, never) {
-		t.Fatal("a request was taken for a peer that left")
+	if err := takeBanScore(&left, 1, tick, gone, never); !errors.Is(err, errNoAnswer) {
+		t.Fatalf("a request to a peer that left ended with %v", err)
 	}
 	if got := left.Int(); got != 0 {
 		t.Fatalf("score %d after a request to a peer that left, want 0", got)
@@ -90,9 +91,9 @@ func TestTakeBanScore(t *testing.T) {
 	setMirrorScore(&decaying, 0, maxMempoolBanScore)
 	go func() { result <- takeBanScore(&decaying, 1, tick, here, never) }()
 	select {
-	case took := <-result:
-		if !took {
-			t.Fatal("a request was not taken once the score decayed")
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("a request was not taken once the score decayed: %v", err)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("a request still waited after the score decayed")
@@ -159,11 +160,11 @@ func TestScriptTreeRequestsCount(t *testing.T) {
 	// The block only has its coinbase, whose output is the one leaf.
 	const each = 3
 	for i := 0; i < each; i++ {
-		if svc.fetchScriptProof(sp.Addr(), *bestHash, 0, svc.quit) == nil {
-			t.Fatalf("no cfproof for request %d", i+1)
+		if _, err := svc.fetchScriptProof(sp.Addr(), *bestHash, 0, svc.quit); err != nil {
+			t.Fatalf("no cfproof for request %d: %v", i+1, err)
 		}
-		if svc.fetchScriptRange(sp.Addr(), *bestHash, 0, [32]byte{}, svc.quit) == nil {
-			t.Fatalf("no cfrange for request %d", i+1)
+		if _, err := svc.fetchScriptRange(sp.Addr(), *bestHash, 0, [32]byte{}, svc.quit); err != nil {
+			t.Fatalf("no cfrange for request %d: %v", i+1, err)
 		}
 	}
 	// What is counted decays, by less than one in the seconds this takes.

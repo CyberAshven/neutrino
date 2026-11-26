@@ -193,6 +193,13 @@ func (f *FilterStore) DeleteFilters(hashes []*chainhash.Hash,
 	return walletdb.Update(f.db, func(tx walletdb.ReadWriteTx) error {
 		filters := tx.ReadWriteBucket(filterBucket)
 
+		// A database without script filters yet has none to delete,
+		// and its bucket isn't made for that.
+		if fType == ScriptFilter &&
+			filters.NestedReadWriteBucket(scriptBucket) == nil {
+
+			return nil
+		}
 		targetBucket, err := writeBucket(filters, fType)
 		if err != nil {
 			return err

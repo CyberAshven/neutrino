@@ -2,7 +2,6 @@ package neutrino
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/gcash/bchd/chaincfg/chainhash"
 	"github.com/gcash/bchd/wire"
@@ -47,7 +46,18 @@ func parseServedFilter(fType wire.FilterType, data []byte) (*gcs.Filter, chainha
 		filter, err := gcs.FromNBytes(builder.DefaultP, builder.DefaultM, data)
 		return filter, chainhash.Hash{}, err
 	case wire.GCSFilterScripts:
-		return builder.ParseScriptFilter(data)
+		filter, root, err := builder.ParseScriptFilter(data)
+		if err != nil {
+			return nil, chainhash.Hash{}, err
+		}
+		values, err := filter.Bytes()
+		if err != nil {
+			return nil, chainhash.Hash{}, err
+		}
+		if err := checkFilterN(filter.N(), filter.P(), values); err != nil {
+			return nil, chainhash.Hash{}, err
+		}
+		return filter, root, nil
 	default:
 		return nil, chainhash.Hash{}, fmt.Errorf("unknown filter type: %v", fType)
 	}
@@ -74,6 +84,3 @@ func servedFilterHeader(fType wire.FilterType, filter *gcs.Filter,
 	}
 	return builder.MakeHeaderForFilter(filter, prevHeader)
 }
-
-// scriptProofTimeout is how long a peer has to answer a getcfproof.
-const scriptProofTimeout = 10 * time.Second

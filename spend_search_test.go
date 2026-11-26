@@ -92,6 +92,11 @@ func (c *spendTestChain) GetCFilter(hash chainhash.Hash, _ wire.FilterType,
 	return c.filters[hash], nil
 }
 
+// FilterType returns the type of the chain's filters: regular ones.
+func (c *spendTestChain) FilterType() wire.FilterType {
+	return wire.GCSFilterRegular
+}
+
 func (c *spendTestChain) GetBlock(hash chainhash.Hash, _ ...QueryOption) (*bchutil.Block, error) {
 	for h, blockHash := range c.hashes {
 		if blockHash == hash {

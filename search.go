@@ -25,6 +25,9 @@ type searchSource interface {
 	GetCFilter(hash chainhash.Hash, filterType wire.FilterType,
 		options ...QueryOption) (*gcs.Filter, error)
 	GetBlock(hash chainhash.Hash, options ...QueryOption) (*bchutil.Block, error)
+
+	// FilterType returns the type of the filters the source syncs.
+	FilterType() wire.FilterType
 }
 
 // scanStep is what a search does after a block that its filter matched.
@@ -133,7 +136,7 @@ func stopped(err error, quit, shutdown <-chan struct{}) error {
 func filterMatches(source searchSource, hash *chainhash.Hash, entries [][]byte,
 	options ...QueryOption) (bool, error) {
 
-	filter, err := source.GetCFilter(*hash, filterTypeOf(source), options...)
+	filter, err := source.GetCFilter(*hash, source.FilterType(), options...)
 	if err != nil {
 		return false, err
 	}

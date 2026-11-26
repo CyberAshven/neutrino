@@ -1136,6 +1136,26 @@ func (s *ChainService) queryEnded(options ...QueryOption) bool {
 	}
 }
 
+// heldFilter returns the filter of a block that we hold, in the cache or in
+// the database, without asking peers for it, or nil when we hold none.
+func (s *ChainService) heldFilter(blockHash chainhash.Hash,
+	filterType wire.FilterType) (*gcs.Filter, error) {
+
+	dbFilterType := dbFilterTypeOf(filterType)
+	filter, err := s.getFilterFromCache(&blockHash, dbFilterType)
+	if err == nil && filter != nil {
+		return filter, nil
+	}
+	if err != nil && err != cache.ErrElementNotFound {
+		return nil, err
+	}
+	filter, err = s.FilterDB.FetchFilter(&blockHash, dbFilterType)
+	if err == filterdb.ErrFilterNotFound {
+		return nil, nil
+	}
+	return filter, err
+}
+
 // getFilterFromCache returns a filter from ChainService's FilterCache if it
 // exists, returning nil and error if it doesn't.
 func (s *ChainService) getFilterFromCache(blockHash *chainhash.Hash,

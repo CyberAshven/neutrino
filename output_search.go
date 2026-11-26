@@ -52,7 +52,7 @@ func searchOutputs(source searchSource, scripts [][]byte, from, to int32,
 	// A regular filter holds the scripts a block pays, a script filter
 	// their keys.
 	match := scripts
-	if filterTypeOf(source) == wire.GCSFilterScripts {
+	if source.FilterType() == wire.GCSFilterScripts {
 		match = make([][]byte, len(scripts))
 		for i, script := range scripts {
 			key := builder.ScriptKey(script)
@@ -137,7 +137,7 @@ func searchCategoryOutputs(source searchSource, categories [][32]byte, from, to 
 	found func(FoundOutput) bool, progress func(height int32),
 	quit, shutdown <-chan struct{}) (int32, error) {
 
-	if filterTypeOf(source) != wire.GCSFilterScripts {
+	if source.FilterType() != wire.GCSFilterScripts {
 		reached := from - 1
 		if from > to {
 			reached = from + 1
