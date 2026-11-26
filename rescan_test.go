@@ -247,13 +247,13 @@ func (c *mockChainSource) rollbackToHeight(height int32,
 	return bestBlock
 }
 
-// ChainParams returns the parameters of the current chain.
 // FilterType returns the type of the filters the mock serves, the regular
 // ones, unless filterType is set.
 func (c *mockChainSource) FilterType() wire.FilterType {
 	return c.filterType
 }
 
+// ChainParams returns the parameters of the current chain.
 func (c *mockChainSource) ChainParams() chaincfg.Params {
 	return chaincfg.MainNetParams
 }
