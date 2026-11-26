@@ -644,8 +644,9 @@ func (a *rpaAsk) ask(peer string, request wire.Message, answers func(wire.Messag
 }
 
 // TestChainRPASource checks what the source that asks peers takes from them:
-// cfilter messages only for the blocks of the run, a late one of an earlier
-// run left out; filter hashes from the peers that serve them, a peer that
+// cfilter messages only for the blocks of the run, each for its own block in
+// whatever order they come, a late one of an earlier run left out; filter
+// hashes from the peers that serve them, a peer that
 // gives none twice left out after that, and a slow one not once enough
 // peers answered.
 func TestChainRPASource(t *testing.T) {
@@ -659,8 +660,10 @@ func TestChainRPASource(t *testing.T) {
 	a.answers = func(peer string, request wire.Message) []wire.Message {
 		switch req := request.(type) {
 		case *wire.MsgGetCFilters:
+			// A peer's messages can arrive out of order: these come
+			// last block first.
 			msgs := []wire.Message{stale, wire.NewMsgCFilter(wire.GCSFilterRegular, &run[0], []byte{2})}
-			for i := range run {
+			for i := len(run) - 1; i >= 0; i-- {
 				msgs = append(msgs, wire.NewMsgCFilter(wire.GCSFilterInputPrefix, &run[i], []byte{byte(i)}))
 			}
 			return msgs
