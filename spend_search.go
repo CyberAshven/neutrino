@@ -3,6 +3,7 @@ package neutrino
 import (
 	"bytes"
 	"errors"
+	"fmt"
 
 	"github.com/gcash/bchd/chaincfg/chainhash"
 	"github.com/gcash/bchd/wire"
@@ -72,7 +73,10 @@ var ErrSpendSearchNeedsScripts = errors.New("a spend search on script " +
 // of their outputs, which is what a service that syncs script filters matches
 // a spend by.  found returns the outpoints to watch from there on with their
 // scripts too.  On a service that syncs regular filters it searches by the
-// outpoints, as SearchSpends does.
+// outpoints, as SearchSpends does.  On script filters each script must be the
+// output's bare locking script, without a token prefix, and an input without
+// one ends the search with ErrInputNeedsScript, whether it is passed or
+// returned by found.
 //
 // A script filter matches every block that pays or spends an output with one
 // of the scripts, so a search for an outpoint whose script is used often
@@ -89,7 +93,15 @@ func searchScriptSpends(source searchSource, inputs []InputWithScript, from, to 
 	found func(FoundSpend) []InputWithScript, progress func(height int32),
 	quit, shutdown <-chan struct{}) (int32, error) {
 
-	scriptFilters := filterTypeOf(source) == wire.GCSFilterScripts
+	fType := source.FilterType()
+	scriptFilters := fType == wire.GCSFilterScripts
+	if err := checkInputScripts(fType, inputs); err != nil {
+		reached := from - 1
+		if from > to {
+			reached = from + 1
+		}
+		return reached, err
+	}
 	watched := make(map[wire.OutPoint]struct{}, len(inputs))
 	scripts := make(map[wire.OutPoint][]byte, len(inputs))
 	for _, input := range inputs {
@@ -106,6 +118,10 @@ func searchScriptSpends(source searchSource, inputs []InputWithScript, from, to 
 		keys := make(map[[32]byte]struct{}, len(watched))
 		match := make([][]byte, 0, len(watched))
 		for outpoint := range watched {
+			if len(scripts[outpoint]) == 0 {
+				return nil, fmt.Errorf("%w: outpoint %v",
+					ErrInputNeedsScript, outpoint)
+			}
 			key := builder.ScriptKey(scripts[outpoint])
 			if _, ok := keys[key]; !ok {
 				keys[key] = struct{}{}
@@ -144,7 +160,7 @@ func searchSpends(source searchSource, outpoints []wire.OutPoint, from, to int32
 	found func(FoundSpend) []wire.OutPoint, progress func(height int32),
 	quit, shutdown <-chan struct{}) (int32, error) {
 
-	if filterTypeOf(source) == wire.GCSFilterScripts {
+	if source.FilterType() == wire.GCSFilterScripts {
 		reached := from - 1
 		if from > to {
 			reached = from + 1
