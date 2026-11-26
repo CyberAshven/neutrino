@@ -34,6 +34,11 @@ type batchSpendReporter struct {
 	//
 	// NOTE: This watchlist is updated during each call to ProcessBlock.
 	filterEntries [][]byte
+
+	// scriptEntries holds the keys of the watched outputs' scripts, which
+	// script filters are matched with, or nil when the watched outpoints
+	// changed since they were hashed.
+	scriptEntries [][]byte
 }
 
 // newBatchSpendReporter instantiates a fresh batchSpendReporter.
@@ -120,6 +125,7 @@ func (b *batchSpendReporter) ProcessBlock(blk *wire.MsgBlock,
 	// the subsequent filters.
 	rebuildWatchlist := len(newReqs) > 0 || len(spends) > 0
 	if rebuildWatchlist {
+		b.scriptEntries = nil
 		b.filterEntries = b.filterEntries[:0]
 		for outpoint, entry := range b.outpoints {
 			b.filterEntries = append(b.filterEntries, entry)
@@ -133,14 +139,23 @@ func (b *batchSpendReporter) ProcessBlock(blk *wire.MsgBlock,
 }
 
 // scriptFilterEntries returns what a script filter is matched with for the
-// watched outpoints: the keys of their outputs' scripts.
+// watched outpoints: the keys of their outputs' scripts, each once.  They are
+// hashed again only after the watched outpoints changed.
 func (b *batchSpendReporter) scriptFilterEntries() [][]byte {
-	entries := make([][]byte, 0, len(b.outpoints))
+	if b.scriptEntries != nil {
+		return b.scriptEntries
+	}
+	keys := make(map[[32]byte]struct{}, len(b.outpoints))
+	b.scriptEntries = make([][]byte, 0, len(b.outpoints))
 	for _, script := range b.outpoints {
 		key := builder.ScriptKey(script)
-		entries = append(entries, key[:])
+		if _, ok := keys[key]; ok {
+			continue
+		}
+		keys[key] = struct{}{}
+		b.scriptEntries = append(b.scriptEntries, key[:])
 	}
-	return entries
+	return b.scriptEntries
 }
 
 // addNewRequests adds a set of new GetUtxoRequests to the spend reporter's
@@ -160,6 +175,7 @@ func (b *batchSpendReporter) addNewRequests(reqs []*GetUtxoRequest) {
 		if _, ok := b.outpoints[outpoint]; !ok {
 			entry := req.Input.PkScript
 			b.outpoints[outpoint] = entry
+			b.scriptEntries = nil
 			b.filterEntries = append(b.filterEntries, entry)
 
 			var buf bytes.Buffer

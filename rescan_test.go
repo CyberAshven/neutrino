@@ -37,6 +37,9 @@ type mockChainSource struct {
 	// the rescan.
 	filterHeaderRollbacks chan uint32
 
+	// filterType is the type of the filters the mock serves.
+	filterType wire.FilterType
+
 	mu                    sync.Mutex // all fields below are protected
 	bestBlock             waddrmgr.BlockStamp
 	blockHeightIndex      map[chainhash.Hash]uint32
@@ -242,6 +245,12 @@ func (c *mockChainSource) rollbackToHeight(height int32,
 	}
 
 	return bestBlock
+}
+
+// FilterType returns the type of the filters the mock serves, the regular
+// ones, unless filterType is set.
+func (c *mockChainSource) FilterType() wire.FilterType {
+	return c.filterType
 }
 
 // ChainParams returns the parameters of the current chain.

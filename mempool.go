@@ -1,11 +1,14 @@
 package neutrino
 
 import (
+	"slices"
+	"sync"
+
 	"github.com/gcash/bchd/btcjson"
 	"github.com/gcash/bchd/chaincfg/chainhash"
 	"github.com/gcash/bchd/txscript"
 	"github.com/gcash/bchutil"
-	"sync"
+	"github.com/gcash/bchutil/gcs/builder"
 )
 
 // Mempool is used when we are downloading unconfirmed transactions.
@@ -18,8 +21,10 @@ type Mempool struct {
 	watchedAddrs  []bchutil.Address
 
 	// watchedScripts holds the output scripts that pay the watched
-	// addresses, to tell the inputs that spend such outputs.
+	// addresses, to tell the inputs that spend such outputs, and
+	// watchedKeys their keys, which script filters hold.
 	watchedScripts map[string]struct{}
+	watchedKeys    [][]byte
 }
 
 // NewMempool returns an initialized mempool
@@ -62,6 +67,21 @@ func (mp *Mempool) AddTransaction(tx *bchutil.Tx) {
 			cb(tx, nil)
 		}
 	}
+}
+
+// spendsWatched is spendsWatchedAddr for a caller that doesn't hold the lock.
+func (mp *Mempool) spendsWatched(tx *bchutil.Tx) bool {
+	mp.mtx.RLock()
+	defer mp.mtx.RUnlock()
+	return mp.spendsWatchedAddr(tx)
+}
+
+// watchedScriptKeys returns the keys of the scripts of the watched addresses,
+// which script filters are matched with.
+func (mp *Mempool) watchedScriptKeys() [][]byte {
+	mp.mtx.RLock()
+	defer mp.mtx.RUnlock()
+	return slices.Clone(mp.watchedKeys)
 }
 
 // spendsWatchedAddr returns whether an input of tx spends an output that pays
@@ -116,6 +136,10 @@ func (mp *Mempool) NotifyReceived(addrs []bchutil.Address) {
 		script, err := txscript.PayToAddrScript(addr)
 		if err != nil {
 			continue
+		}
+		if _, ok := mp.watchedScripts[string(script)]; !ok {
+			key := builder.ScriptKey(script)
+			mp.watchedKeys = append(mp.watchedKeys, key[:])
 		}
 		mp.watchedScripts[string(script)] = struct{}{}
 	}

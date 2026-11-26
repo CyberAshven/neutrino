@@ -362,15 +362,15 @@ func (c *chainRPASource) filterHashes(start int32,
 		wg.Add(1)
 		go func(peer string) {
 			defer wg.Done()
-			msg := c.s.askPeer(peer,
+			msg, err := c.s.askPeer(peer,
 				wire.NewMsgGetCFHeaders(wire.GCSFilterInputPrefix, uint32(start), &stop),
 				func(msg wire.Message) bool {
 					headers, ok := msg.(*wire.MsgCFHeaders)
 					return ok && headers.FilterType == wire.GCSFilterInputPrefix &&
 						headers.StopHash == stop
-				}, rpaFilterTimeout, c.s.quit,
+				}, replyWait{quiet: rpaFilterTimeout, most: rpaFilterTimeout}, c.s.quit,
 			)
-			if msg == nil {
+			if err != nil {
 				return
 			}
 			mtx.Lock()
@@ -389,7 +389,7 @@ func (c *chainRPASource) filters(peer string, start int32, stop chainhash.Hash,
 	// they can arrive out of order; one filter for each block is taken.
 	var msgs []*wire.MsgCFilter
 	seen := make(map[chainhash.Hash]bool, count)
-	last := c.s.askPeer(peer,
+	_, err := c.s.askPeer(peer,
 		wire.NewMsgGetCFilters(wire.GCSFilterInputPrefix, uint32(start), &stop),
 		func(msg wire.Message) bool {
 			filter, ok := msg.(*wire.MsgCFilter)
@@ -399,9 +399,9 @@ func (c *chainRPASource) filters(peer string, start int32, stop chainhash.Hash,
 			seen[filter.BlockHash] = true
 			msgs = append(msgs, filter)
 			return len(msgs) == count
-		}, rpaFilterTimeout, c.s.quit,
+		}, replyWait{quiet: rpaFilterTimeout, most: rpaFilterTimeout}, c.s.quit,
 	)
-	if last == nil {
+	if err != nil {
 		return nil
 	}
 	return msgs

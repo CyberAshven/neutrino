@@ -171,6 +171,70 @@ type disputePeer struct {
 	// cfrange before it is sent.
 	askedRanges int
 	tamperRange func(*wire.MsgCFRange)
+
+	// behind is how many requests the peer ignores before it answers, as
+	// a node that isn't current does, and quitting has every request end
+	// as when we shut down.
+	behind   int
+	quitting bool
+
+	// maxRangeLeaves, when set, is the most leaves the peer answers a
+	// cfrange with, as a node doesn't answer for a range too large for
+	// one message.
+	maxRangeLeaves int
+}
+
+// answer answers a getcfproof as a source does: errNoAnswer for no answer.
+func (p *disputePeer) answer(index uint32) (*wire.MsgCFProof, error) {
+	if p.quitting {
+		return nil, ErrShuttingDown
+	}
+	if p.behind > 0 {
+		p.behind--
+		p.asked++
+		return nil, errNoAnswer
+	}
+	msg := p.proof(index)
+	if msg == nil {
+		return nil, errNoAnswer
+	}
+	// Through the wire encoding, as a peer's message arrives, unless a
+	// change made it one the encoding refuses, which the checks are to
+	// refuse too.
+	var buf bytes.Buffer
+	if err := msg.BchEncode(&buf, wire.ProtocolVersion, wire.BaseEncoding); err != nil {
+		return msg, nil
+	}
+	read := new(wire.MsgCFProof)
+	if err := read.BchDecode(&buf, wire.ProtocolVersion, wire.BaseEncoding); err != nil {
+		return msg, nil
+	}
+	return read, nil
+}
+
+// answerRange answers a getcfrange as a source does.
+func (p *disputePeer) answerRange(bits uint16, prefix [32]byte) (*wire.MsgCFRange, error) {
+	if p.quitting {
+		return nil, ErrShuttingDown
+	}
+	if p.behind > 0 {
+		p.behind--
+		p.askedRanges++
+		return nil, errNoAnswer
+	}
+	msg := p.rangeOf(bits, prefix)
+	if msg == nil || (p.maxRangeLeaves > 0 && len(msg.Leaves) > p.maxRangeLeaves) {
+		return nil, errNoAnswer
+	}
+	var buf bytes.Buffer
+	if err := msg.BchEncode(&buf, wire.ProtocolVersion, wire.BaseEncoding); err != nil {
+		return msg, nil
+	}
+	read := new(wire.MsgCFRange)
+	if err := read.BchDecode(&buf, wire.ProtocolVersion, wire.BaseEncoding); err != nil {
+		return msg, nil
+	}
+	return read, nil
 }
 
 func (p *disputePeer) root() chainhash.Hash {
@@ -219,32 +283,31 @@ func (p *disputePeer) proof(index uint32) *wire.MsgCFProof {
 	return msg
 }
 
-// settle runs a dispute among peers and returns the peers found at fault,
-// sorted.
-func (c *disputeChain) settle(peers map[string]*disputePeer) []string {
+// settle runs a dispute among peers and returns the peers found at fault and
+// those that couldn't be told apart, each sorted, and the error.
+func (c *disputeChain) settleAll(peers map[string]*disputePeer) (bad, unsure []string, err error) {
 	roots := make(map[string]chainhash.Hash)
 	for name, p := range peers {
 		roots[name] = p.root()
 	}
-	fetch := func(peer string, index uint32) *wire.MsgCFProof {
-		msg := peers[peer].proof(index)
-		if msg == nil {
-			return nil
-		}
-		// Through the wire encoding, as a peer's message arrives.
-		var buf bytes.Buffer
-		if err := msg.BchEncode(&buf, wire.ProtocolVersion, wire.BaseEncoding); err != nil {
-			return nil
-		}
-		read := new(wire.MsgCFProof)
-		if err := read.BchDecode(&buf, wire.ProtocolVersion, wire.BaseEncoding); err != nil {
-			return nil
-		}
-		return read
+	fetch := func(peer string, index uint32) (*wire.MsgCFProof, error) {
+		return peers[peer].answer(index)
 	}
-	bad := settleScriptFilterDispute(c.block.header.BlockHash(), &c.block.header,
+	bad, unsure, err = settleScriptFilterDispute(c.block.header.BlockHash(), &c.block.header,
 		c.block.height, roots, fetch, c.headers, c.smallTxUntil)
 	slices.Sort(bad)
+	slices.Sort(unsure)
+	return bad, unsure, err
+}
+
+// settle runs a dispute among peers and returns the peers found at fault,
+// sorted.  It fails the test on peers that couldn't be told apart.
+func (c *disputeChain) settle(t *testing.T, peers map[string]*disputePeer) []string {
+	t.Helper()
+	bad, unsure, err := c.settleAll(peers)
+	if err != nil || len(unsure) != 0 {
+		t.Fatalf("not settled: %v couldn't be told apart, %v", unsure, err)
+	}
 	return bad
 }
 
@@ -284,7 +347,7 @@ func TestSettleScriptFilterDispute(t *testing.T) {
 	check := func(name string, liar *disputePeer) {
 		t.Helper()
 		honest := c.honest()
-		bad := c.settle(map[string]*disputePeer{"honest": honest, "liar": liar})
+		bad := c.settle(t, map[string]*disputePeer{"honest": honest, "liar": liar})
 		if len(bad) != 1 || bad[0] != "liar" {
 			t.Errorf("%s: peers at fault %v, want the liar", name, bad)
 		}
@@ -406,15 +469,10 @@ func TestSettleScriptFilterDispute(t *testing.T) {
 	}
 	check("a spent output's leaf with a made-up transaction", forged)
 
-	// No leaves at all, and a peer that doesn't answer.
+	// No leaves at all.
 	check("an empty tree", c.liar(true, func([]builder.ScriptLeaf) []builder.ScriptLeaf {
 		return nil
 	}))
-	silent := c.liar(true, func(l []builder.ScriptLeaf) []builder.ScriptLeaf {
-		return l[1:]
-	})
-	silent.silent = true
-	check("a peer that doesn't answer", silent)
 
 	// A proof whose branch belongs to another tree.
 	foreign := c.liar(true, func(l []builder.ScriptLeaf) []builder.ScriptLeaf {
@@ -438,7 +496,7 @@ func TestSettleScriptFilterDisputePeers(t *testing.T) {
 			return slices.Delete(l, i, i+1)
 		})
 	}
-	bad := c.settle(map[string]*disputePeer{
+	bad := c.settle(t, map[string]*disputePeer{
 		"honest": c.honest(), "liar1": omit(3), "liar2": omit(3), "liar3": omit(10),
 		"liar4": c.liar(true, func(l []builder.ScriptLeaf) []builder.ScriptLeaf { return l[:1] }),
 	})
@@ -446,8 +504,62 @@ func TestSettleScriptFilterDisputePeers(t *testing.T) {
 		t.Errorf("peers at fault %v, want %v", bad, want)
 	}
 
-	if bad := c.settle(map[string]*disputePeer{"a": c.honest(), "b": c.honest()}); len(bad) != 0 {
+	if bad := c.settle(t, map[string]*disputePeer{"a": c.honest(), "b": c.honest()}); len(bad) != 0 {
 		t.Errorf("peers that agree found at fault: %v", bad)
+	}
+}
+
+// TestSettleScriptFilterDisputeNoAnswer checks that a peer that doesn't
+// answer, as a node that isn't current or is gone, is never found at fault:
+// against a liar it is left out of the dispute, without blame, and so is an
+// honest one that doesn't answer against the liar, while the liar is still
+// found at fault by another honest peer.  Shutting down ends the dispute with
+// an error and no verdict.
+func TestSettleScriptFilterDisputeNoAnswer(t *testing.T) {
+	c := newDisputeChain(t)
+	omit := func() *disputePeer {
+		return c.liar(true, func(l []builder.ScriptLeaf) []builder.ScriptLeaf {
+			return slices.Delete(l, 3, 4)
+		})
+	}
+
+	// Neither a liar nor an honest peer that doesn't answer is at fault.
+	for _, silentHonest := range []bool{false, true} {
+		honest, liar := c.honest(), omit()
+		silent := liar
+		if silentHonest {
+			silent = honest
+		}
+		silent.silent = true
+		bad, unsure, err := c.settleAll(map[string]*disputePeer{
+			"honest": honest, "liar": liar,
+		})
+		if err != nil || len(bad) != 0 || len(unsure) != 1 {
+			t.Errorf("silent honest %v: at fault %v, unsure %v, %v",
+				silentHonest, bad, unsure, err)
+		}
+	}
+
+	// A node that ignores the first requests, as one that's catching
+	// up does, is left out and not blamed, and the other honest peer
+	// shows the liar wrong.
+	behind, liar := c.honest(), omit()
+	behind.behind = 1
+	bad, unsure, err := c.settleAll(map[string]*disputePeer{
+		"behind": behind, "honest": c.honest(), "liar": liar,
+	})
+	if err != nil || !slices.Equal(bad, []string{"liar"}) || slices.Contains(bad, "behind") {
+		t.Errorf("a node behind: at fault %v, unsure %v, %v", bad, unsure, err)
+	}
+
+	// Shutting down ends it with no verdict.
+	quitting, liar := c.honest(), omit()
+	quitting.quitting = true
+	bad, unsure, err = c.settleAll(map[string]*disputePeer{
+		"quitting": quitting, "liar": liar,
+	})
+	if !errors.Is(err, ErrShuttingDown) || len(bad) != 0 || len(unsure) != 0 {
+		t.Errorf("shutting down: at fault %v, unsure %v, %v", bad, unsure, err)
 	}
 }
 
@@ -485,7 +597,9 @@ func TestIsTrueScriptLeaf(t *testing.T) {
 	for i := range c.leaves {
 		fresh := func() *scriptLeafProof {
 			tree := newScriptTree("peer", block.header.BlockHash(), peer.root(),
-				func(_ string, index uint32) *wire.MsgCFProof { return peer.proof(index) })
+				func(_ string, index uint32) (*wire.MsgCFProof, error) {
+					return peer.answer(index)
+				})
 			proof, err := tree.leaf(uint32(i))
 			if err != nil {
 				t.Fatalf("leaf %d: %v", i, err)
@@ -605,35 +719,34 @@ func (p *disputePeer) servedFilter(t *testing.T) servedScriptFilter {
 	return servedScriptFilter{root: p.root(), filter: data}
 }
 
-// settleFilters runs a dispute over the filters peers serve, and returns the
-// peers found at fault, sorted.
-func (c *disputeChain) settleFilters(t *testing.T, peers map[string]*disputePeer) []string {
+// settleFiltersAll runs a dispute over the filters peers serve, and returns
+// the peers found at fault, sorted, and the error.
+func (c *disputeChain) settleFiltersAll(t *testing.T, peers map[string]*disputePeer) ([]string, error) {
 	t.Helper()
 	served := make(map[string]servedScriptFilter)
 	for name, p := range peers {
 		served[name] = p.servedFilter(t)
 	}
-	proofs := func(peer string, index uint32) *wire.MsgCFProof {
-		return peers[peer].proof(index)
+	proofs := func(peer string, index uint32) (*wire.MsgCFProof, error) {
+		return peers[peer].answer(index)
 	}
-	ranges := func(peer string, bits uint16, prefix [32]byte) *wire.MsgCFRange {
-		msg := peers[peer].rangeOf(bits, prefix)
-		if msg == nil {
-			return nil
-		}
-		var buf bytes.Buffer
-		if err := msg.BchEncode(&buf, wire.ProtocolVersion, wire.BaseEncoding); err != nil {
-			return nil
-		}
-		read := new(wire.MsgCFRange)
-		if err := read.BchDecode(&buf, wire.ProtocolVersion, wire.BaseEncoding); err != nil {
-			return nil
-		}
-		return read
+	ranges := func(peer string, bits uint16, prefix [32]byte) (*wire.MsgCFRange, error) {
+		return peers[peer].answerRange(bits, prefix)
 	}
-	bad := settleScriptFilters(c.block.header.BlockHash(), &c.block.header,
+	bad, err := settleScriptFilters(c.block.header.BlockHash(), &c.block.header,
 		c.block.height, served, proofs, ranges, c.headers, c.smallTxUntil)
 	slices.Sort(bad)
+	return bad, err
+}
+
+// settleFilters runs a dispute over the filters peers serve, and returns the
+// peers found at fault, sorted.  It fails the test when it isn't settled.
+func (c *disputeChain) settleFilters(t *testing.T, peers map[string]*disputePeer) []string {
+	t.Helper()
+	bad, err := c.settleFiltersAll(t, peers)
+	if err != nil {
+		t.Fatalf("not settled: %v", err)
+	}
 	return bad
 }
 
@@ -676,10 +789,12 @@ func TestSettleScriptFiltersSameRoot(t *testing.T) {
 			if !slices.Equal(bad, []string{"liar", "liar2"}) {
 				t.Errorf("%d leaves a run, %s: peers at fault %v", perRange, name, bad)
 			}
-			// The leaves are fetched once, from one peer, and no leaf
-			// is proved when the roots agree.
+			// The leaves are fetched once, from one peer.  When the
+			// roots agree, a leaf is proved only to tell whether a
+			// run would hold too many, which a run of 100000 can't.
 			runs := honest.askedRanges + liar.askedRanges + liar2.askedRanges
-			if runs < 2 || (perRange == 1 && runs < 17) || honest.asked+liar.asked+liar2.asked != 0 {
+			proofs := honest.asked + liar.asked + liar2.asked
+			if runs < 2 || (perRange == 1 && runs < 17) || (perRange == 100000 && proofs != 0) {
 				t.Errorf("%d leaves a run, %s: %d runs and %d proofs asked for",
 					perRange, name, runs, honest.asked+liar.asked+liar2.asked)
 			}
@@ -714,8 +829,11 @@ func TestFetchScriptLeaves(t *testing.T) {
 
 	fetchFrom := func(p *disputePeer) ([]builder.ScriptLeaf, error) {
 		return fetchScriptLeaves("peer", hash, builder.ScriptLeavesRoot(c.leaves),
-			func(_ string, bits uint16, prefix [32]byte) *wire.MsgCFRange {
-				return p.rangeOf(bits, prefix)
+			func(_ string, bits uint16, prefix [32]byte) (*wire.MsgCFRange, error) {
+				return p.answerRange(bits, prefix)
+			},
+			func(_ string, index uint32) (*wire.MsgCFProof, error) {
+				return p.answer(index)
 			})
 	}
 	for _, perRange := range []uint32{100000, 8, 3, 1} {
@@ -746,7 +864,6 @@ func TestFetchScriptLeaves(t *testing.T) {
 			p.tamperRange = func(msg *wire.MsgCFRange) { msg.LeafCount++ }
 		},
 		"another tree": func(p *disputePeer) { p.leaves = p.leaves[1:] },
-		"no answer":    func(p *disputePeer) { p.silent = true },
 	}
 	for name, change := range bad {
 		p := c.honest()
@@ -754,6 +871,13 @@ func TestFetchScriptLeaves(t *testing.T) {
 		if _, err := fetchFrom(p); !errors.Is(err, errScriptProof) {
 			t.Errorf("%s: got %v", name, err)
 		}
+	}
+
+	// A peer that doesn't answer isn't at fault.
+	p := c.honest()
+	p.silent = true
+	if _, err := fetchFrom(p); !errors.Is(err, errNoAnswer) {
+		t.Errorf("no answer: got %v", err)
 	}
 }
 
@@ -901,13 +1025,13 @@ func TestScriptTreeLeafCountWraps(t *testing.T) {
 	checkBranch(uint32(n), pad)
 
 	var asked []uint32
-	fetch := func(peer string, index uint32) *wire.MsgCFProof {
+	fetch := func(peer string, index uint32) (*wire.MsgCFProof, error) {
 		if peer == "honest" {
-			return honest.proof(index)
+			return honest.answer(index)
 		}
 		asked = append(asked, index)
 		if index > uint32(n) {
-			return nil
+			return nil, errNoAnswer
 		}
 		leaf := pad
 		if int(index) < n {
@@ -921,12 +1045,15 @@ func TestScriptTreeLeafCountWraps(t *testing.T) {
 			Leaf:       wire.CFLeaf(leaf.Bytes()),
 			LeafBranch: branchOf(uint64(index)),
 			Tx:         wire.NewMsgTx(1),
-		}
+		}, nil
 	}
-	bad := settleScriptFilterDispute(c.block.header.BlockHash(), &c.block.header,
+	bad, unsure, err := settleScriptFilterDispute(c.block.header.BlockHash(), &c.block.header,
 		c.block.height, map[string]chainhash.Hash{
 			"honest": honest.root(), "liar": root,
 		}, fetch, c.headers, c.smallTxUntil)
+	if err != nil || len(unsure) != 0 {
+		t.Fatalf("not settled: %v, %v", unsure, err)
+	}
 	slices.Sort(bad)
 	if !slices.Equal(bad, []string{"liar"}) {
 		t.Fatalf("peers at fault %v, proofs asked of the liar %v", bad, asked)
@@ -948,8 +1075,11 @@ func TestFetchScriptLeavesClaimedCount(t *testing.T) {
 		}
 	}
 	_, err := fetchScriptLeaves("peer", c.block.header.BlockHash(), p.root(),
-		func(_ string, bits uint16, prefix [32]byte) *wire.MsgCFRange {
-			return p.rangeOf(bits, prefix)
+		func(_ string, bits uint16, prefix [32]byte) (*wire.MsgCFRange, error) {
+			return p.answerRange(bits, prefix)
+		},
+		func(_ string, index uint32) (*wire.MsgCFProof, error) {
+			return p.answer(index)
 		})
 	if !errors.Is(err, errScriptProof) {
 		t.Fatalf("got %v", err)
@@ -1062,7 +1192,7 @@ func TestSettleSmallTxLeaf(t *testing.T) {
 		t.Fatal("no leaf of the 64-byte transaction")
 		return nil
 	})
-	bad := c.settle(map[string]*disputePeer{"honest": c.honest(), "liar": liar})
+	bad := c.settle(t, map[string]*disputePeer{"honest": c.honest(), "liar": liar})
 	if !slices.Equal(bad, []string{"liar"}) {
 		t.Fatalf("peers at fault %v", bad)
 	}
@@ -1079,9 +1209,12 @@ func TestFetchScriptLeavesMost(t *testing.T) {
 	fetch := func() ([]builder.ScriptLeaf, error) {
 		p := c.honest()
 		return fetchScriptLeaves("peer", hash, builder.ScriptLeavesRoot(c.leaves),
-			func(_ string, bits uint16, prefix [32]byte) *wire.MsgCFRange {
+			func(_ string, bits uint16, prefix [32]byte) (*wire.MsgCFRange, error) {
 				asked++
-				return p.rangeOf(bits, prefix)
+				return p.answerRange(bits, prefix)
+			},
+			func(_ string, index uint32) (*wire.MsgCFProof, error) {
+				return p.answer(index)
 			})
 	}
 

@@ -393,9 +393,10 @@ func TestMempoolIntervalAskedAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	now = now.Add(mpTxsWait - time.Second)
+	wait := mpTxsWaitFor(2)
+	now = now.Add(wait - time.Second)
 	if got := m.next(allowMempoolScore); got != nil {
-		t.Fatalf("asked again after %v: %v", mpTxsWait-time.Second, got)
+		t.Fatalf("asked again after %v: %v", wait-time.Second, got)
 	}
 	now = now.Add(time.Second)
 	requireRun(t, m.next(allowMempoolScore), 2, 2)
@@ -403,7 +404,7 @@ func TestMempoolIntervalAskedAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	now = now.Add(mpTxsWait)
+	now = now.Add(mpTxsWaitFor(1))
 	if got := m.next(allowMempoolScore); got != nil {
 		t.Fatalf("an answered interval was asked again: %v", got)
 	}

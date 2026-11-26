@@ -245,20 +245,28 @@ func (r *mempoolRequester) candidates() []*ServerPeer {
 }
 
 // ask asks sp for the filter of its mempool and, when it matches entries, for
-// its mempool.  It returns false when sp could not be asked, didn't answer, or
-// the mempool message no longer fits the ban score.  The caller then tries
-// another peer, and the request stays wanted until a peer finishes it.  It
-// returns true once sp has answered and any mempool message the answer calls
-// for was sent.
+// its mempool.  It returns false when sp could not be asked, as its ban score
+// has no room for both, or didn't answer.  The caller then tries another
+// peer, and the request stays wanted until a peer finishes it.  It returns
+// true once sp has answered and any mempool message the answer calls for was
+// sent.
 func (r *mempoolRequester) ask(sp *ServerPeer, entries [][]byte) bool {
 	filterScore, mempoolScore := mempoolBanScores(sp.UserAgent())
 
-	// Reserve the filter and the mempool message together.  A peer that
-	// no longer has room for both is one candidates would have skipped:
-	// nothing is sent, and the peer does not sit out.
-	if !sp.mempoolScore.tryTake(filterScore, filterScore+mempoolScore, maxMempoolBanScore) {
+	// Count the filter and hold room for the mempool message, which no
+	// other request to the peer may then use, such as one for the proofs
+	// of a script filter.  A peer that no longer has room for both is one
+	// candidates would have skipped: nothing is sent, and the peer does
+	// not sit out.
+	if !sp.mempoolScore.tryReserve(filterScore, mempoolScore, maxMempoolBanScore) {
 		return false
 	}
+	held := true
+	defer func() {
+		if held {
+			sp.mempoolScore.release(mempoolScore)
+		}
+	}()
 
 	msgChan := make(chan spMsg)
 	subQuit := make(chan struct{})
@@ -299,13 +307,10 @@ func (r *mempoolRequester) ask(sp *ServerPeer, entries [][]byte) bool {
 				return false
 			}
 			if matched {
-				// The filter is in.  Count the mempool message
-				// only while it still fits.  A false return sends
-				// no mempool message and leaves the request wanted,
-				// so a later tick asks again.
-				if !sp.mempoolScore.tryTake(mempoolScore, mempoolScore, maxMempoolBanScore) {
-					return false
-				}
+				// The filter is in, and the room held for the
+				// mempool message is counted for it.
+				sp.mempoolScore.claim(mempoolScore)
+				held = false
 				sp.QueueMessage(wire.NewMsgMemPool(), nil)
 				r.watchDrop(sp)
 			}
