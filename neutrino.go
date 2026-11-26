@@ -641,6 +641,11 @@ type ChainService struct {
 	filterType    wire.FilterType
 	filterHeaders *headerfs.FilterHeaderStore
 
+	// dataDir and db are where the header stores are, that of the filter
+	// type we don't sync too.
+	dataDir string
+	db      walletdb.DB
+
 	FilterCache *lru.Cache
 	BlockCache  *lru.Cache
 
@@ -803,6 +808,23 @@ func NewChainService(cfg Config) (*ChainService, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.dataDir, s.db = cfg.DataDir, cfg.Database
+
+	// A service that fails to be made closes the header stores it opened,
+	// whose files would otherwise stay open, and on Windows keep them from
+	// being removed.
+	made := false
+	defer func() {
+		if made {
+			return
+		}
+		if closer, ok := s.BlockHeaders.(io.Closer); ok {
+			_ = closer.Close()
+		}
+		if s.filterHeaders != nil {
+			_ = s.filterHeaders.Close()
+		}
+	}()
 	headerType, err := headerTypeOf(cfg.FilterType)
 	if err != nil {
 		return nil, err
@@ -907,6 +929,7 @@ func NewChainService(cfg Config) (*ChainService, error) {
 		return nil, fmt.Errorf("unable to initialize ban store: %v", err)
 	}
 
+	made = true
 	return &s, nil
 }
 
@@ -1101,6 +1124,15 @@ func (s *ChainService) rollBackToHeight(height uint32) (*waddrmgr.BlockStamp, er
 		return nil, err
 	}
 
+	// The headers of the filter type we don't sync share the index of the
+	// blocks, whose entries for the blocks rolled back are deleted, so
+	// their tip is rolled back too, or their store couldn't be opened
+	// again.
+	other, otherHeight := s.otherFilterHeaders()
+	if other != nil {
+		defer func() { _ = other.Close() }()
+	}
+
 	for uint32(bs.Height) > height {
 		header, headerHeight, err := s.BlockHeaders.FetchHeader(&bs.Hash)
 		if err != nil {
@@ -1108,6 +1140,14 @@ func (s *ChainService) rollBackToHeight(height uint32) (*waddrmgr.BlockStamp, er
 		}
 
 		newTip := &header.PrevBlock
+
+		if other != nil && uint32(bs.Height) <= otherHeight {
+			otherTip, err := other.RollbackLastBlock(newTip)
+			if err != nil {
+				return nil, err
+			}
+			otherHeight = uint32(otherTip.Height)
+		}
 
 		// Only roll back filter headers if they've caught up this far.
 		if uint32(bs.Height) <= regHeight {
@@ -1671,6 +1711,37 @@ func (s *ChainService) UpdatePeerHeights(latestBlkHash *chainhash.Hash,
 	case <-s.quit:
 		return
 	}
+}
+
+// otherFilterHeaders opens the store of the filter headers of the type we
+// don't sync, when one was made in our data directory, and returns it with
+// its tip's height, or nil when there is none or it can't be opened.
+func (s *ChainService) otherFilterHeaders() (*headerfs.FilterHeaderStore, uint32) {
+	if s.db == nil {
+		return nil, 0
+	}
+	otherType := headerfs.ScriptFilter
+	if s.filterType == wire.GCSFilterScripts {
+		otherType = headerfs.RegularFilter
+	}
+	exists, err := headerfs.FilterHeaderStoreExists(s.dataDir, otherType)
+	if err != nil || !exists {
+		return nil, 0
+	}
+	store, err := headerfs.NewFilterHeaderStore(
+		s.dataDir, s.db, otherType, &s.chainParams, nil,
+	)
+	if err != nil {
+		log.Warnf("Unable to open the filter headers of the type we "+
+			"don't sync to roll them back: %v", err)
+		return nil, 0
+	}
+	_, height, err := store.ChainTip()
+	if err != nil {
+		_ = store.Close()
+		return nil, 0
+	}
+	return store, height
 }
 
 // ChainParams returns a copy of the ChainService's chaincfg.Params.
