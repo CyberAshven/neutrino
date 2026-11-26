@@ -102,22 +102,47 @@ type headerStore struct {
 	*headerIndex
 }
 
+// headerFileName returns the name of the flat file of a header type.
+func headerFileName(hType HeaderType) (string, error) {
+	switch hType {
+	case Block:
+		return "block_headers.bin", nil
+	case RegularFilter:
+		return "reg_filter_headers.bin", nil
+	case ScriptFilter:
+		return "script_filter_headers.bin", nil
+	default:
+		return "", fmt.Errorf("unrecognized filter type: %v", hType)
+	}
+}
+
+// FilterHeaderStoreExists returns whether the flat file of the filter headers
+// of a type is in filePath, so that a store of that type was made there.
+func FilterHeaderStoreExists(filePath string, filterType HeaderType) (bool, error) {
+	name, err := headerFileName(filterType)
+	if err != nil {
+		return false, err
+	}
+	_, err = os.Stat(filepath.Join(filePath, name))
+	switch {
+	case err == nil:
+		return true, nil
+	case os.IsNotExist(err):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
 // newHeaderStore creates a new headerStore given an already open database, a
 // target file path for the flat-file and a particular header type. The target
 // file will be created as necessary.
 func newHeaderStore(db walletdb.DB, filePath string,
 	hType HeaderType) (*headerStore, error) {
 
-	var flatFileName string
-	switch hType {
-	case Block:
-		flatFileName = "block_headers.bin"
-	case RegularFilter:
-		flatFileName = "reg_filter_headers.bin"
-	case ScriptFilter:
-		flatFileName = "script_filter_headers.bin"
-	default:
-		return nil, fmt.Errorf("unrecognized filter type: %v", hType)
+	flatFileName, err := headerFileName(hType)
+	if err != nil {
+		return nil, err
 	}
 
 	flatFileName = filepath.Join(filePath, flatFileName)
@@ -134,6 +159,7 @@ func newHeaderStore(db walletdb.DB, filePath string,
 	// have random access into the flat files.
 	index, err := newHeaderIndex(db, hType)
 	if err != nil {
+		_ = headerFile.Close()
 		return nil, err
 	}
 
@@ -178,6 +204,15 @@ func NewBlockHeaderStore(filePath string, db walletdb.DB,
 		return nil, err
 	}
 
+	// A store that fails to open closes its file, which would otherwise
+	// stay open, and on Windows keep it from being removed.
+	opened := false
+	defer func() {
+		if !opened {
+			_ = hStore.file.Close()
+		}
+	}()
+
 	// With the header store created, we'll fetch the file size to see if
 	// we need to initialize it with the first header or not.
 	fileInfo, err := hStore.file.Stat()
@@ -200,6 +235,7 @@ func NewBlockHeaderStore(filePath string, db walletdb.DB,
 			return nil, err
 		}
 
+		opened = true
 		return bhs, nil
 	}
 
@@ -225,6 +261,7 @@ func NewBlockHeaderStore(filePath string, db walletdb.DB,
 	// done here.
 	latestBlockHash := latestFileHeader.BlockHash()
 	if tipHash.IsEqual(&latestBlockHash) {
+		opened = true
 		return bhs, nil
 	}
 
@@ -242,6 +279,7 @@ func NewBlockHeaderStore(filePath string, db walletdb.DB,
 		fileHeight--
 	}
 
+	opened = true
 	return bhs, nil
 }
 
@@ -661,6 +699,15 @@ func NewFilterHeaderStore(filePath string, db walletdb.DB,
 		return nil, err
 	}
 
+	// A store that fails to open closes its file, which would otherwise
+	// stay open, and on Windows keep it from being removed.
+	opened := false
+	defer func() {
+		if !opened {
+			_ = fStore.file.Close()
+		}
+	}()
+
 	// With the header store created, we'll fetch the fiie size to see if
 	// we need to initialize it with the first header or not.
 	fileInfo, err := fStore.file.Stat()
@@ -725,6 +772,7 @@ func NewFilterHeaderStore(filePath string, db walletdb.DB,
 			return nil, err
 		}
 
+		opened = true
 		return fhs, nil
 	}
 
@@ -739,8 +787,9 @@ func NewFilterHeaderStore(filePath string, db walletdb.DB,
 		}
 
 		// If the filter header store was reset, we'll re-initialize it
-		// to recreate our on-disk state.
+		// to recreate our on-disk state.  The reset closed the file.
 		if reset {
+			opened = true
 			return NewFilterHeaderStore(
 				filePath, db, filterType, netParams, nil,
 			)
@@ -767,6 +816,7 @@ func NewFilterHeaderStore(filePath string, db walletdb.DB,
 	// If the index's tip hash, and the file on-disk match, then we're
 	// doing here.
 	if tipHash.IsEqual(latestFileHeader) {
+		opened = true
 		return fhs, nil
 	}
 
@@ -782,6 +832,7 @@ func NewFilterHeaderStore(filePath string, db walletdb.DB,
 
 	// TODO(roasbeef): make above into func
 
+	opened = true
 	return fhs, nil
 }
 
