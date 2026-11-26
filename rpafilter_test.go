@@ -165,6 +165,16 @@ func (c *rpaTestChain) bad(peer string) {
 	}
 }
 
+// mustEncodeRPAFilter codes sorted, distinct values as an input prefix filter.
+func mustEncodeRPAFilter(t *testing.T, values []uint16) []byte {
+	t.Helper()
+	filter, err := builder.EncodeRPAFilter(values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filter
+}
+
 // rpaTestTx returns a transaction spending count outpoints of a txid made
 // from tag.
 func rpaTestTx(tag byte, count int) *wire.MsgTx {
@@ -382,7 +392,7 @@ func TestSearchRPAPrefixesDisagreement(t *testing.T) {
 		}
 		values, _ := builder.DecodeRPAFilter(filter)
 		values = slices.DeleteFunc(values, func(v uint16) bool { return v == target })
-		return builder.EncodeRPAFilter(values)
+		return mustEncodeRPAFilter(t, values)
 	}}
 	found, _, err := c.search(t, []RPAPrefix{{Value: target, Bits: 16}}, 0, 19)
 	if err != nil || len(found) == 0 || found[0].Height != 7 {
@@ -487,7 +497,7 @@ func TestSearchRPAPrefixesWrongFilters(t *testing.T) {
 			values, _ := builder.DecodeRPAFilter(filter)
 			values = append(values, fake)
 			slices.Sort(values)
-			return builder.EncodeRPAFilter(slices.Compact(values))
+			return mustEncodeRPAFilter(t, slices.Compact(values))
 		},
 		"a filter that doesn't decode": func([]byte) []byte { return []byte{0xff} },
 	} {
@@ -719,5 +729,63 @@ func TestChainRPASource(t *testing.T) {
 	}
 	if a.asked["slow"] != 3 {
 		t.Errorf("a slow peer was asked %d times, want 3", a.asked["slow"])
+	}
+}
+
+// TestSearchRPAPrefixesBitmap checks a block whose filter is coded as a
+// bitmap, as one with RPAFilterBitmapFrom values or more is: its inputs are
+// found by a full value and by a short prefix, and a peer that leaves a value
+// out of the bitmap is shown wrong by the block.
+func TestSearchRPAPrefixesBitmap(t *testing.T) {
+	c := newRPATestChain(3)
+	coinbase := wire.NewMsgTx(1)
+	coinbase.AddTxIn(wire.NewTxIn(wire.NewOutPoint(&chainhash.Hash{}, wire.MaxPrevOutIndex),
+		[]byte{3, 0, 0xbb}))
+	coinbase.AddTxOut(wire.NewTxOut(5000, []byte{0x51}, wire.TokenData{}))
+	msg := wire.NewMsgBlock(&wire.BlockHeader{Version: 4, PrevBlock: *c.blocks[2].Hash(),
+		Nonce: 3, Bits: 0xbb})
+	msg.Transactions = []*wire.MsgTx{coinbase}
+	for i := 0; i < 900; i++ {
+		tx := wire.NewMsgTx(2)
+		for j := 0; j < 30; j++ {
+			tx.AddTxIn(wire.NewTxIn(wire.NewOutPoint(&chainhash.Hash{byte(i), byte(i >> 8), 0xbb}, uint32(j)), nil))
+		}
+		tx.AddTxOut(wire.NewTxOut(1000, []byte{0x51}, wire.TokenData{}))
+		msg.Transactions = append(msg.Transactions, tx)
+	}
+	big := bchutil.NewBlock(msg)
+	big.SetHeight(3)
+	c.blocks = append(c.blocks, big)
+	c.known[*big.Hash()] = big
+
+	filter := builder.BuildRPAFilter(msg)
+	values, err := builder.DecodeRPAFilter(filter)
+	if err != nil || len(values) < builder.RPAFilterBitmapFrom || filter[3] != builder.RPAFilterBitmap {
+		t.Fatalf("the block's filter of %d values is not a bitmap: %v", len(values), err)
+	}
+
+	target := c.inputsAt(3)[100]
+	found, reached, err := c.search(t, []RPAPrefix{{Value: target, Bits: 16}}, 0, 3)
+	if err != nil || reached != 3 || len(found) != 1 || found[0].Height != 3 {
+		t.Fatalf("a full value: reached %d, found %+v, %v", reached, found, err)
+	}
+	if !slices.ContainsFunc(found[0].Inputs, func(in RPAInput) bool { return in.Value == target }) {
+		t.Errorf("the input with the value isn't among %d", len(found[0].Inputs))
+	}
+	found, _, err = c.search(t, []RPAPrefix{{Value: target >> 12, Bits: 4}}, 3, 3)
+	if err != nil || len(found) != 1 {
+		t.Fatalf("a 4-bit prefix: found %d blocks, %v", len(found), err)
+	}
+
+	c.peers["liar"] = &rpaTestPeer{edit: func(height int32, filter []byte) []byte {
+		if height != 3 {
+			return filter
+		}
+		values, _ := builder.DecodeRPAFilter(filter)
+		return mustEncodeRPAFilter(t, slices.DeleteFunc(values, func(v uint16) bool { return v == target }))
+	}}
+	found, _, err = c.search(t, []RPAPrefix{{Value: target, Bits: 16}}, 0, 3)
+	if err != nil || len(found) != 1 || !slices.Equal(c.banned, []string{"liar"}) {
+		t.Fatalf("a liar: found %d, banned %v, %v", len(found), c.banned, err)
 	}
 }

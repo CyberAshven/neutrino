@@ -58,4 +58,4 @@ tool github.com/gcash/bchd
 
 replace github.com/gcash/bchd => github.com/CyberAshven/bchd v0.22.1-0.20261116202941-60816369d828
 
-replace github.com/gcash/bchutil => github.com/CyberAshven/bchutil v0.0.0-20261116202852-85610ab9ca38
+replace github.com/gcash/bchutil => github.com/CyberAshven/bchutil v0.0.0-20261126051837-bcad7d10b2c3
