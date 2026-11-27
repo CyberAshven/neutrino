@@ -28,7 +28,11 @@ import (
 // hashes of the run's blocks are read once, as the ancestors of its last
 // block, and every request names them, so a reorg while the run is searched
 // can't mix two chains.  The peers that serve type 2 give the hashes of
-// their filters; where they disagree, the block is downloaded, its filter is
+// their filters: from cfheaders, or, from a peer that serves type 2 filters
+// and no type 2 filter headers, as a node that builds each filter when asked
+// and keeps nothing for it does, as the double SHA-256 of each of its
+// filters, which is how BIP 157 defines the filter hash.  Where they
+// disagree, the block is downloaded, its filter is
 // built from it, and the peers that gave another hash are wrong.  The filters
 // are then fetched from one peer and checked against those hashes.  A block
 // whose filter matches is downloaded, its filter is built from it and
@@ -162,11 +166,10 @@ type rpaSource interface {
 	onChain(hash chainhash.Hash, height int32) bool
 
 	// filterHashes asks the peers that serve type 2 for the filter hashes
-	// of the blocks from start up to the one with stop's hash, and returns
-	// the answers by peer.  It waits for every peer it asks, or, once
-	// minPeers have answered, a short grace.  A peer that doesn't answer
-	// is left out.
-	filterHashes(start int32, stop chainhash.Hash, minPeers int,
+	// of the blocks of a run, hashes, from start, and returns the answers
+	// by peer.  It waits for every peer it asks, or, once minPeers have
+	// answered, a short grace.  A peer that doesn't answer is left out.
+	filterHashes(start int32, hashes []chainhash.Hash, minPeers int,
 		quit <-chan struct{}) (map[string]*wire.MsgCFHeaders, error)
 
 	// filters asks a peer for the filters of the given blocks, from start,
@@ -258,7 +261,7 @@ func agreeRPAFilterHashes(src rpaSource, run *rpaRun, minPeers int,
 
 	count := len(run.hashes)
 	stopHash := run.hashes[count-1]
-	replies, err := src.filterHashes(run.from, stopHash, minPeers, quit)
+	replies, err := src.filterHashes(run.from, run.hashes, minPeers, quit)
 	if err != nil {
 		return nil, err
 	}
@@ -581,7 +584,9 @@ func (s *ChainService) SearchRPAPrefixes(prefixes []RPAPrefix, start, end int32,
 	quit <-chan struct{}, options ...RPASearchOption) (int32, error) {
 
 	src := &chainRPASource{s: s, ask: s.askPeer, peers: s.rpaPeers,
-		missed: make(map[string]int), silent: make(map[string]time.Time)}
+		missed: make(map[string]int), silent: make(map[string]time.Time),
+		filtersOnly: make(map[string]time.Time),
+		fetched:     make(map[string]map[chainhash.Hash][]byte)}
 	return searchRPAPrefixes(src, prefixes, start, end, found, progress, quit,
 		options...)
 }
@@ -598,8 +603,10 @@ func (s *ChainService) rpaPeers() []string {
 }
 
 // chainRPASource reads blocks and filters from a ChainService's peers.  It
-// remembers the peers that don't give filter hashes, which don't serve
-// type 2, and leaves them out for a while.
+// remembers the peers that give neither filter hashes nor filters, which
+// don't serve type 2, and leaves them out for a while, and the peers that
+// give filters but no filter hashes, which it asks for their filters
+// straight away for a while.
 type chainRPASource struct {
 	s   *ChainService
 	ask func(peer string, request wire.Message, answers func(wire.Message) bool,
@@ -609,6 +616,14 @@ type chainRPASource struct {
 	mtx    sync.Mutex
 	missed map[string]int
 	silent map[string]time.Time
+
+	// filtersOnly holds the peers that serve type 2 filters but no type 2
+	// filter headers, until when they are not asked for filter headers.
+	filtersOnly map[string]time.Time
+
+	// fetched holds the filters a peer gave in place of filter hashes,
+	// until they are asked for, so that they are not fetched twice.
+	fetched map[string]map[chainhash.Hash][]byte
 }
 
 func (c *chainRPASource) tip() (int32, error) {
@@ -651,7 +666,7 @@ func (c *chainRPASource) onChain(hash chainhash.Hash, height int32) bool {
 	return err == nil && header.BlockHash() == hash
 }
 
-func (c *chainRPASource) filterHashes(start int32, stop chainhash.Hash, minPeers int,
+func (c *chainRPASource) filterHashes(start int32, hashes []chainhash.Hash, minPeers int,
 	quit <-chan struct{}) (map[string]*wire.MsgCFHeaders, error) {
 
 	// Peers left out while they are known not to answer.
@@ -683,19 +698,7 @@ func (c *chainRPASource) filterHashes(start int32, stop chainhash.Hash, minPeers
 	answers := make(chan answer, len(asked))
 	for _, peer := range asked {
 		go func() {
-			msg, err := c.ask(peer,
-				wire.NewMsgGetCFHeaders(wire.GCSFilterInputPrefix, uint32(start), &stop),
-				func(msg wire.Message) bool {
-					headers, ok := msg.(*wire.MsgCFHeaders)
-					return ok && headers.FilterType == wire.GCSFilterInputPrefix &&
-						headers.StopHash == stop
-				}, rpaFilterWait, askQuit,
-			)
-			if err != nil {
-				answers <- answer{peer: peer}
-				return
-			}
-			answers <- answer{peer: peer, msg: msg.(*wire.MsgCFHeaders)}
+			answers <- answer{peer: peer, msg: c.peerFilterHashes(peer, start, hashes, askQuit)}
 		}()
 	}
 
@@ -733,8 +736,8 @@ func (c *chainRPASource) filterHashes(start int32, stop chainhash.Hash, minPeers
 	for _, peer := range silent {
 		c.missed[peer]++
 		if c.missed[peer] >= 2 {
-			log.Debugf("Peer %v gives no input prefix filter hashes, "+
-				"leaving it out for %v", peer, rpaSilentFor)
+			log.Debugf("Peer %v gives no input prefix filter hashes or "+
+				"filters, leaving it out for %v", peer, rpaSilentFor)
 			c.silent[peer] = now.Add(rpaSilentFor)
 			delete(c.missed, peer)
 		}
@@ -742,8 +745,90 @@ func (c *chainRPASource) filterHashes(start int32, stop chainhash.Hash, minPeers
 	return got, nil
 }
 
+// peerFilterHashes returns a peer's filter hashes of the blocks of a run, or
+// nil.  A peer that gives no cfheaders for them is asked for the run's
+// filters, and the double SHA-256 of each filter, the filter hash of BIP
+// 157, stands in for its answer, in a message no one reads the previous
+// filter header of: such a peer serves type 2 filters and keeps no type 2
+// filter headers.  Its filters are kept for the run, and in the runs that
+// follow, for a while, it is asked for its filters straight away.
+func (c *chainRPASource) peerFilterHashes(peer string, start int32,
+	hashes []chainhash.Hash, quit <-chan struct{}) *wire.MsgCFHeaders {
+
+	stop := hashes[len(hashes)-1]
+	c.mtx.Lock()
+	until, filtersOnly := c.filtersOnly[peer]
+	filtersOnly = filtersOnly && time.Now().Before(until)
+	c.mtx.Unlock()
+
+	if !filtersOnly {
+		msg, err := c.ask(peer,
+			wire.NewMsgGetCFHeaders(wire.GCSFilterInputPrefix, uint32(start), &stop),
+			func(msg wire.Message) bool {
+				headers, ok := msg.(*wire.MsgCFHeaders)
+				return ok && headers.FilterType == wire.GCSFilterInputPrefix &&
+					headers.StopHash == stop
+			}, rpaFilterWait, quit,
+		)
+		if err == nil {
+			return msg.(*wire.MsgCFHeaders)
+		}
+		if !errors.Is(err, errNoAnswer) {
+			return nil
+		}
+	}
+
+	byBlock, err := c.filters(peer, start, hashes, quit)
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if err != nil || byBlock == nil {
+		delete(c.filtersOnly, peer)
+		return nil
+	}
+	msg := wire.NewMsgCFHeaders()
+	msg.FilterType = wire.GCSFilterInputPrefix
+	msg.StopHash = stop
+	for _, hash := range hashes {
+		filterHash := builder.GetRPAFilterHash(byBlock[hash])
+		if err := msg.AddCFHash(&filterHash); err != nil {
+			return nil
+		}
+	}
+	if c.filtersOnly == nil {
+		c.filtersOnly = make(map[string]time.Time)
+	}
+	if c.fetched == nil {
+		c.fetched = make(map[string]map[chainhash.Hash][]byte)
+	}
+	if !filtersOnly {
+		log.Debugf("Peer %v serves input prefix filters without their "+
+			"filter hashes; taking the hashes of its filters", peer)
+	}
+	c.filtersOnly[peer] = time.Now().Add(rpaSilentFor)
+	c.fetched[peer] = byBlock
+	return msg
+}
+
 func (c *chainRPASource) filters(peer string, start int32, hashes []chainhash.Hash,
 	quit <-chan struct{}) (map[chainhash.Hash][]byte, error) {
+
+	// The filters a peer gave in place of filter hashes for this run.
+	c.mtx.Lock()
+	kept := c.fetched[peer]
+	delete(c.fetched, peer)
+	c.mtx.Unlock()
+	if len(kept) == len(hashes) {
+		all := true
+		for _, hash := range hashes {
+			if _, ok := kept[hash]; !ok {
+				all = false
+				break
+			}
+		}
+		if all {
+			return kept, nil
+		}
+	}
 
 	// A peer's messages are handed to us each on its own goroutine, so
 	// they can arrive out of order; one filter for each block of the run is

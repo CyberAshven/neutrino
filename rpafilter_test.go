@@ -111,9 +111,10 @@ func (c *rpaTestChain) ancestors(start int32, stop chainhash.Hash) []chainhash.H
 	return hashes
 }
 
-func (c *rpaTestChain) filterHashes(start int32, stop chainhash.Hash, _ int,
+func (c *rpaTestChain) filterHashes(start int32, hashes []chainhash.Hash, _ int,
 	_ <-chan struct{}) (map[string]*wire.MsgCFHeaders, error) {
 
+	stop := hashes[len(hashes)-1]
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	answers := make(map[string]*wire.MsgCFHeaders)
@@ -596,14 +597,14 @@ type rpaQuietAfter struct {
 	calls *int
 }
 
-func (s *rpaQuietAfter) filterHashes(start int32, stop chainhash.Hash, minPeers int,
+func (s *rpaQuietAfter) filterHashes(start int32, hashes []chainhash.Hash, minPeers int,
 	quit <-chan struct{}) (map[string]*wire.MsgCFHeaders, error) {
 
 	*s.calls++
 	if *s.calls > s.runs {
 		return nil, nil
 	}
-	return s.rpaTestChain.filterHashes(start, stop, minPeers, quit)
+	return s.rpaTestChain.filterHashes(start, hashes, minPeers, quit)
 }
 
 // rpaSwitchSource serves, for one peer, filters other than those whose hashes
@@ -656,9 +657,11 @@ func (a *rpaAsk) ask(peer string, request wire.Message, answers func(wire.Messag
 // TestChainRPASource checks what the source that asks peers takes from them:
 // cfilter messages only for the blocks of the run, each for its own block in
 // whatever order they come, a late one of an earlier run left out; filter
-// hashes from the peers that serve them, a peer that
-// gives none twice left out after that, and a slow one not once enough
-// peers answered.
+// hashes from the peers that serve them; from a peer that serves the filters
+// and no filter hashes, the hashes of its filters, which it is asked for
+// straight away in the runs after, and kept to be handed over without asking
+// again; a peer that gives neither twice left out after that, and a slow one
+// not once enough peers answered.
 func TestChainRPASource(t *testing.T) {
 	c := newRPATestChain(20)
 	run := make([]chainhash.Hash, 5)
@@ -667,9 +670,13 @@ func TestChainRPASource(t *testing.T) {
 	}
 	stale := wire.NewMsgCFilter(wire.GCSFilterInputPrefix, c.blocks[3].Hash(), []byte{1})
 	a := &rpaAsk{asked: make(map[string]int), slow: map[string]bool{"slow": true}}
+	cfheaders := make(map[string]int)
 	a.answers = func(peer string, request wire.Message) []wire.Message {
 		switch req := request.(type) {
 		case *wire.MsgGetCFilters:
+			if peer == "old" {
+				return nil
+			}
 			// A peer's messages can arrive out of order: these come
 			// last block first.
 			msgs := []wire.Message{stale, wire.NewMsgCFilter(wire.GCSFilterRegular, &run[0], []byte{2})}
@@ -678,16 +685,24 @@ func TestChainRPASource(t *testing.T) {
 			}
 			return msgs
 		case *wire.MsgGetCFHeaders:
-			if peer == "old" {
+			a.mtx.Lock()
+			cfheaders[peer]++
+			a.mtx.Unlock()
+			if peer == "old" || peer == "filters" {
 				return nil
 			}
 			msg := &wire.MsgCFHeaders{FilterType: wire.GCSFilterInputPrefix, StopHash: req.StopHash}
+			for i := range run {
+				filterHash := builder.GetRPAFilterHash([]byte{byte(i)})
+				msg.FilterHashes = append(msg.FilterHashes, &filterHash)
+			}
 			return []wire.Message{&wire.MsgCFHeaders{FilterType: wire.GCSFilterRegular,
 				StopHash: req.StopHash}, msg}
 		}
 		return nil
 	}
-	src := &chainRPASource{ask: a.ask, peers: func() []string { return []string{"a", "b", "old", "slow"} },
+	src := &chainRPASource{ask: a.ask,
+		peers:  func() []string { return []string{"a", "b", "filters", "old", "slow"} },
 		missed: make(map[string]int), silent: make(map[string]time.Time)}
 
 	got, err := src.filters("a", 10, run, nil)
@@ -703,29 +718,53 @@ func TestChainRPASource(t *testing.T) {
 		}
 	}
 
-	for range 3 {
+	for round := range 3 {
 		var answers map[string]*wire.MsgCFHeaders
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			answers, err = src.filterHashes(10, run[4], 2, nil)
+			answers, err = src.filterHashes(10, run, 2, nil)
 		}()
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):
 			t.Fatal("the filter hashes waited for the slow peer")
 		}
-		if err != nil || len(answers) != 2 || answers["a"] == nil || answers["b"] == nil {
+		if err != nil || len(answers) != 3 || answers["a"] == nil || answers["b"] == nil ||
+			answers["filters"] == nil {
+
 			t.Fatalf("filter hashes from %v, %v", answers, err)
 		}
 		for _, msg := range answers {
-			if msg.FilterType != wire.GCSFilterInputPrefix {
+			if msg.FilterType != wire.GCSFilterInputPrefix || msg.StopHash != run[4] {
 				t.Fatal("another filter type's headers were taken")
 			}
 		}
+		// The hashes of the filters of the peer that serves no filter
+		// hashes are the ones the others give.
+		for i := range run {
+			if *answers["filters"].FilterHashes[i] != *answers["a"].FilterHashes[i] {
+				t.Errorf("round %d: hash %d from the filters is %v, the peers give %v", round, i,
+					answers["filters"].FilterHashes[i], answers["a"].FilterHashes[i])
+			}
+		}
+		// Its filters are handed over without asking for them again.
+		before := a.asked["filters"]
+		kept, err := src.filters("filters", 10, run, nil)
+		if err != nil || len(kept) != len(run) || a.asked["filters"] != before {
+			t.Errorf("round %d: the filters given for the hashes were asked for again "+
+				"(%d asks, then %d): %v, %v", round, before, a.asked["filters"], kept, err)
+		}
 	}
-	if a.asked["old"] != 2 {
-		t.Errorf("a peer that gives no filter hashes was asked %d times, want 2", a.asked["old"])
+	if cfheaders["filters"] != 1 {
+		t.Errorf("a peer that serves filters and no filter hashes was asked for "+
+			"them %d times, want 1", cfheaders["filters"])
+	}
+	// Asked for filter hashes and then for filters in the first two rounds,
+	// and not at all after.
+	if a.asked["old"] != 4 {
+		t.Errorf("a peer that gives neither filter hashes nor filters was asked %d times, "+
+			"want 4", a.asked["old"])
 	}
 	if a.asked["slow"] != 3 {
 		t.Errorf("a slow peer was asked %d times, want 3", a.asked["slow"])
